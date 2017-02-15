@@ -2,39 +2,44 @@
 Runs the testbed
 """
 # TODO
-# - replace constraints files with appropriate branch names
-# - make docs commands in .travis.ymls seem to not work
-# - nose seems not to work sometimes
-    # - make an alias to python that points to the python virtual env
-    # - or install nose beforehand?
+# - version import on schemas failing
+# - solution: rewrite with expect: http://stackoverflow.com/questions/28614911/opening-persistent-shell-in-python
+    # - make docs commands in .travis.ymls seem to not work
+    # - nose seems not to work sometimes
+        # - problem: is using tbenv python, not correct ve python
 # - add server, compliance repos
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import argparse
 import os
 import shutil
 
 import ga4gh.common.utils as utils
 
 
-class Configuration(object):
-    """
-    The testbed configuration
-    """
-    def __init__(self, repositories):
-        self.repositories = repositories
-        self.run_repo_tests = True
+class CommandRunner(object):
+
+    def runCommand(self, cmd):
+        utils.log("CMD: '{}'".format(cmd))
+        silent = True
+        if VERBOSITY > 1:
+            silent = False
+        utils.runCommand(cmd, silent=silent)
 
 
-class Repository(object):
+class Repository(CommandRunner):
     """
-    A repository for the configuration
+    A repository
     """
-    def __init__(self, name, branch, org):
-        self.name = name
-        self.branch = branch
-        self.org = org
+    def __init__(self, repoDict):
+        self.name = repoDict['name']
+        self.branch = repoDict['branch']
+        self.org = repoDict['org']
+        self.egg = repoDict['egg']
+        self.dependencies = repoDict['dependencies']
+        self.runRepoTests = repoDict['runRepoTests']
 
     def git_url(self):
         url = "https://github.com/{}/{}.git --branch {}".format(
@@ -43,7 +48,7 @@ class Repository(object):
 
     def clone(self):
         shutil.rmtree(self.name, True)
-        utils.runCommand("git clone {}".format(self.git_url()))
+        self.runCommand("git clone {}".format(self.git_url()))
 
     def install_dependencies(self, virtualenv):
         with utils.performInDirectory(self.name):
@@ -58,7 +63,8 @@ class CommonRepository(Repository):
 
     def run_tests(self, virtualenv):
         with utils.performInDirectory(self.name):
-            virtualenv.run_with_python("run_tests_dev.py")
+            virtualenv.run_with_python("run_tests_dev.py -p {}".format(
+                virtualenv.get_python_path()))
 
 
 class SchemaRepository(Repository):
@@ -69,12 +75,13 @@ class SchemaRepository(Repository):
             virtualenv.install_dependencies()
 
 
-class VirtualEnvironment(object):
+class VirtualEnvironment(CommandRunner):
     """
     Provides methods to create and access a python virtual environment
     """
-    def __init__(self, name):
+    def __init__(self, name, repo):
         self.name = name
+        self.repo = repo
 
     def _dirs_above_prefix(self, num_dirs):
         return ''.join(['../' for _ in range(num_dirs)])
@@ -82,57 +89,119 @@ class VirtualEnvironment(object):
     def create(self):
         shutil.rmtree(self.name, True)
         virtualenv_cmd = "virtualenv {}".format(self.name)
-        utils.runCommand(virtualenv_cmd)
+        self.runCommand(virtualenv_cmd)
         self.abspath = os.path.abspath(self.name)
 
+    def get_python_path(self):
+        return "{}/bin/python".format(self.abspath)
+
+    def get_pip_path(self):
+        return "{}/bin/pip".format(self.abspath)
+
     def run_with_pip(self, cmd, dirs_above=1):
-        pip_cmd = "{}/bin/pip {}".format(self.abspath, cmd)
-        utils.runCommand(pip_cmd)
+        pip_cmd = "{} {}".format(self.get_pip_path(), cmd)
+        self.runCommand(pip_cmd)
 
     def run_with_python(self, cmd, dirs_above=1):
-        python_cmd = "{}/bin/python {}".format(self.abspath, cmd)
-        utils.runCommand(python_cmd)
+        python_cmd = "{} {}".format(self.get_python_path(), cmd)
+        self.runCommand(python_cmd)
 
     def run_tests(self):
-        test_cmd = "{}/bin/ga4gh_run_tests".format(self.abspath)
+        test_cmd = "{}/bin/ga4gh_run_tests -p {}".format(
+            self.abspath, self.get_python_path())
         self.run_with_python(test_cmd)
 
     def install_dependencies(self):
         install_cmd = "install -r dev-requirements.txt"
         if os.path.exists("constraints.txt"):
+            self.create_constraints_file()
             install_cmd = \
                 "install -r dev-requirements.txt -c constraints.txt"
         self.run_with_pip(install_cmd)
 
+    def create_constraints_file(self):
+        dependencies = self.repo.dependencies
+        if not dependencies:
+            return
+        with open('constraints.txt', 'w') as constraintsFile,\
+                open('constraints.txt.default', 'w') as defaultFile:
+            for dependency in dependencies:
+                repoDict = CONFIG[dependency]
+                line = 'git+git://github.com/{}/{}.git@{}#egg={}\n'.format(
+                    repoDict['org'], repoDict['name'],
+                    repoDict['branch'], repoDict['egg'])
+                constraintsFile.write(line)
+                defaultFile.write(line)
 
 
-def setup():
-    CONFIG = [
-        ['ga4gh-common', 'master', 'ga4gh', CommonRepository],
-        ['schemas', 'testbed', 'dcolligan', SchemaRepository],
-        ['ga4gh-client', 'master', 'ga4gh', Repository],
-    ]
-    repositories = []
-    for repo, branch, org, repo_class in CONFIG:
-        repository = repo_class(repo, branch, org)
-        repositories.append(repository)
-    config = Configuration(repositories)
-    return config
+def do_repo_tests():
+    for repo in REPOSITORIES:
+        if repo.runRepoTests:
+            virtualenv_name = "ve-{}".format(repo.name)
+            virtualenv = VirtualEnvironment(
+                virtualenv_name, repo)
+            virtualenv.create()
+            repo.clone()
+            repo.install_dependencies(virtualenv)
+            repo.run_tests(virtualenv)
 
 
-def do_repo_tests(config):
-    for repo in config.repositories:
-        virtualenv_name = "ve-{}".format(repo.name)
-        virtualenv = VirtualEnvironment(virtualenv_name)
-        virtualenv.create()
-        repo.clone()
-        repo.install_dependencies(virtualenv)
-        repo.run_tests(virtualenv)
+defaultVerbosity = 2
+
+
+VERBOSITY = defaultVerbosity
+
+
+REPO_ORDER = ['ga4gh-common', 'schemas', 'ga4gh-client']
+
+
+CONFIG = {
+    'ga4gh-common': {
+        'name': 'ga4gh-common',
+        'branch': 'testbed', 
+        'org': 'dcolligan', 
+        'egg': 'ga4gh_common', 
+        'repoClass': CommonRepository,
+        'dependencies': [],
+        'runRepoTests': False,
+    },
+    'schemas': {
+        'name': 'schemas',
+        'branch': 'master',
+        'org': 'dcolligan',
+        'egg': 'ga4gh_schemas',
+        'repoClass': SchemaRepository,
+        'dependencies': ['ga4gh-common'],
+        'runRepoTests': True,
+    },
+    'ga4gh-client': {
+        'name': 'ga4gh-client',
+        'branch': 'master',
+        'org': 'ga4gh',
+        'egg': 'ga4gh_client',
+        'repoClass': Repository,
+        'dependencies': ['ga4gh-common', 'schemas'],
+        'runRepoTests': True,
+    },
+}
+
+
+REPOSITORIES = []
+for repoName in REPO_ORDER:
+    repoDict = CONFIG[repoName]
+    repo = repoDict['repoClass'](repoDict)
+    REPOSITORIES.append(repo)
+
+
 
 def main():
-    config = setup()
-    if config.run_repo_tests:
-        do_repo_tests(config)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbosity", type=int,
+            default=defaultVerbosity,
+            help="verbosity level, defaults to {}".format(defaultVerbosity))
+    args = parser.parse_args()
+    VERBOSITY = args.verbosity
+    do_repo_tests()
 
 
 if __name__ == '__main__':
