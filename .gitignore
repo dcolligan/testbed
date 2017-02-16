@@ -1,4 +1,6 @@
 ga4gh-client
 ga4gh-common
 schemas
+server
 ve-*
+*.sh
