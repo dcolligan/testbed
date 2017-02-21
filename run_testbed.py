@@ -8,17 +8,18 @@ By default, this means:
 (We can't script this purely from python because we need a persistent
 shell running an appropriate virtual environment for when deeper commands
 call 'python', etc.)
+
+Drawbacks:
+    - does not test all of the functionality that Travis does (e.g. making
+        sure the executables can run without import errors)
 """
 # TODO
-# - version import on schemas failing
-# - 'no module named protocol' on client, server
+# - use relative paths
 # - add compliance repo
-# - move config to different module
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import argparse
 import os
 
 import ga4gh.common.utils as utils
@@ -56,6 +57,7 @@ class Repository(object):
         self.runRepoTests = repoDict['runRepoTests']
         self.constraintsDir = repoDict['constraintsDir']
         self.vename = None
+        self.vepath = None
         self.veabspath = None
 
     def _perform_in_dir_cmds(self, path, cmds):
@@ -79,6 +81,9 @@ class Repository(object):
         ]
         return cmds
 
+    def pre_deps_cmds(self):
+        return []
+
     def install_dependencies_cmds(self):
         constraintsDir = self.name
         if self.constraintsDir is not None:
@@ -86,14 +91,16 @@ class Repository(object):
                 self.name, self.constraintsDir)
         cmds = self._perform_in_dir_cmds(
             constraintsDir,
-            self._install_dependencies_cmds())
+            self._install_dependencies_cmds(constraintsDir))
         return cmds
 
-    def _install_dependencies_cmds(self):
-        install_cmd = "install -r dev-requirements.txt"
-        if os.path.exists("constraints.txt"):
-            install_cmd = \
-                "install -r dev-requirements.txt -c constraints.txt"
+    def _install_dependencies_cmds(self, constraintsDir):
+        install_cmd = "install -r dev-requirements.txt --upgrade"
+        constraintsPath = os.path.join(constraintsDir, "constraints.txt")
+        if os.path.exists(constraintsPath):
+            install_cmd = (
+                "install -r dev-requirements.txt "
+                "-c constraints.txt --upgrade")
         return self.run_with_ve_pip_cmd(install_cmd)
 
     def run_with_ve_pip_cmd(self, cmd):
@@ -102,6 +109,9 @@ class Repository(object):
 
     def get_ve_pip_path(self):
         return "{}/bin/pip".format(self.veabspath)
+
+    def pre_test_cmds(self):
+        return []
 
     def run_tests_cmds(self):
         cmds = self._perform_in_dir_cmds(
@@ -118,12 +128,19 @@ class Repository(object):
         python_cmd = "{} {}".format(self.get_ve_python_path(), cmd)
         return python_cmd
 
+    def setup_cmds(self):
+        cmds = [
+            'set -e',  # script fails if any command fails
+        ]
+        return cmds
+
     def create_ve_cmds(self, vename):
         cmds = [
             'rm -rf {}'.format(vename),
             'virtualenv {}'.format(vename)
         ]
         self.vename = vename
+        self.vepath = os.path.join('.', vename)
         self.veabspath = os.path.join(
             os.path.abspath(os.getcwd()), vename)
         return cmds
@@ -179,25 +196,46 @@ class CommonRepository(Repository):
         return cmds
 
 
+class SchemasRepository(Repository):
+
+    def pre_test_cmds(self):
+        # needed to generate the _version file
+        return self._perform_in_dir_cmds(
+            self.name,
+            ["python setup.py install"])
+
+
+class ServerRepository(Repository):
+
+    def pre_deps_cmds(self):
+        return self._perform_in_dir_cmds(self.name, [
+            "easy_install distribute",
+            self.run_with_ve_pip_cmd("install --upgrade distribute"),
+        ])
+
+    def pre_test_cmds(self):
+        return self._perform_in_dir_cmds(
+            self.name, [
+                "python scripts/build_test_data.py",
+            ])
+
+
 def do_repo_tests():
     for repo in REPOSITORIES:
         if repo.runRepoTests:
             shell = ShellEnvironment('{}-tests.sh'.format(repo.name))
             virtualenv_name = "ve-{}".format(repo.name)
+            shell.writeCommands(repo.setup_cmds())
             shell.writeCommands(repo.create_ve_cmds(virtualenv_name))
             shell.writeCommand(repo.enter_ve_cmd())
             shell.writeCommands(repo.clone_cmds())
             shell.writeCommands(repo.create_constraints_file_cmds())
+            shell.writeCommands(repo.pre_deps_cmds())
             shell.writeCommands(repo.install_dependencies_cmds())
+            shell.writeCommands(repo.pre_test_cmds())
             shell.writeCommands(repo.run_tests_cmds())
             shell.writeCommand(repo.leave_ve_cmd())
             shell.execute()
-
-
-defaultVerbosity = 2
-
-
-VERBOSITY = defaultVerbosity
 
 
 REPO_ORDER = ['ga4gh-common', 'schemas', 'ga4gh-client', 'server']
@@ -207,7 +245,7 @@ CONFIG = {
     'ga4gh-common': {
         'name': 'ga4gh-common',
         'branch': 'master',
-        'org': 'dcolligan',
+        'org': 'ga4gh',
         'egg': 'ga4gh_common',
         'repoClass': CommonRepository,
         'dependencies': [],
@@ -217,11 +255,11 @@ CONFIG = {
     'schemas': {
         'name': 'schemas',
         'branch': 'master',
-        'org': 'dcolligan',
+        'org': 'ga4gh',
         'egg': 'ga4gh_schemas',
-        'repoClass': Repository,
+        'repoClass': SchemasRepository,
         'dependencies': ['ga4gh-common'],
-        'runRepoTests': False,
+        'runRepoTests': True,
         'constraintsDir': 'python',
     },
     'ga4gh-client': {
@@ -231,7 +269,7 @@ CONFIG = {
         'egg': 'ga4gh_client',
         'repoClass': Repository,
         'dependencies': ['ga4gh-common', 'schemas'],
-        'runRepoTests': False,
+        'runRepoTests': True,
         'constraintsDir': None,
     },
     'server': {
@@ -239,9 +277,9 @@ CONFIG = {
         'branch': 'master',
         'org': 'ga4gh',
         'egg': 'server',
-        'repoClass': Repository,
+        'repoClass': ServerRepository,
         'dependencies': ['ga4gh-common', 'schemas', 'ga4gh-client'],
-        'runRepoTests': False,
+        'runRepoTests': True,
         'constraintsDir': None,
     },
 }
@@ -255,13 +293,6 @@ for repoName in REPO_ORDER:
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-v", "--verbosity", type=int,
-        default=defaultVerbosity,
-        help="verbosity level, defaults to {}".format(defaultVerbosity))
-    args = parser.parse_args()
-    VERBOSITY = args.verbosity
     do_repo_tests()
 
 
